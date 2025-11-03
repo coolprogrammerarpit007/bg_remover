@@ -1,116 +1,104 @@
-import os
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
-from fastapi.responses import FileResponse
+import os, base64, datetime
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
-import aiofiles
-import uuid
-from database import get_db, Base, engine
-from crud import create_image_record, update_processing_started, update_processing_done, update_processing_failed, get_image
-from utils import remove_background_local
-import sys
+from dotenv import load_dotenv
+import re
 
-
+from database import get_db
+from models import Image
+from crud import save_image_record
+from utils import remove_bg_bytes
+from database import Base, engine
 Base.metadata.create_all(bind=engine)
+
+# Load ENV
+load_dotenv()
+BASE_URL = os.getenv("BASE_URL", "http://localhost:9000")
 
 app = FastAPI(title="Background Remover API")
 
+# ✅ Base directory of this file
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-app.mount("/images", StaticFiles(directory="images"), name="images")
+# ✅ Image directories
+IMAGE_DIR = os.path.join(BASE_DIR, "images")
+ORIGINAL_DIR = os.path.join(IMAGE_DIR, "originals")
+PROCESSED_DIR = os.path.join(IMAGE_DIR, "processed")
 
-UPLOAD_DIR = "images"
-ORIGINALS_DIR = os.path.join(UPLOAD_DIR, "originals")
-PROCESSED_DIR = os.path.join(UPLOAD_DIR, "processed")
-
-os.makedirs(ORIGINALS_DIR, exist_ok=True)
+# ✅ Create folders if not exists
+os.makedirs(ORIGINAL_DIR, exist_ok=True)
 os.makedirs(PROCESSED_DIR, exist_ok=True)
 
-ALLOWED_CONTENT = {"image/png", "image/jpeg", "image/webp", "image/jpg"}
+# ✅ Static file mount
+app.mount("/images", StaticFiles(directory=IMAGE_DIR), name="images")
 
 
-@app.post("/upload", status_code=201)
-async def upload_image(file: UploadFile = File(...), db: Session = Depends(get_db)):
-    if file.content_type not in ALLOWED_CONTENT:
-        raise HTTPException(status_code=400, detail="Unsupported file type")
+# ✅ Schema for Base64 input
+class ImageBase64(BaseModel):
+    image_base64: str
 
-    ext = file.filename.split(".")[-1]
-    unique_name = f"{uuid.uuid4().hex}.{ext}"
-    orig_path = os.path.join(ORIGINALS_DIR, unique_name)
 
-    async with aiofiles.open(orig_path, 'wb') as out_file:
-        content = await file.read()
-        await out_file.write(content)
-
-    
-    orig_url = f"/images/originals/{unique_name}"
-    img_record = create_image_record(db, file.filename, orig_url)
-
+@app.post("/remove-bg")
+async def remove_background(data: ImageBase64, db: Session = Depends(get_db)):
     try:
-        update_processing_started(db, img_record)
+        # Remove "data:image/...;base64," prefix if exists
+        image_base64_clean = re.sub('^data:image/\\w+;base64,', '', data.image_base64)
 
-        processed_name = f"{uuid.uuid4().hex}.png"
-        processed_path = os.path.join(PROCESSED_DIR, processed_name)
+        # Convert to bytes
+        image_bytes = base64.b64decode(image_base64_clean)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid Base64 string")
 
-        
-        remove_background_local(orig_path, processed_path)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")
+    orig_name = f"orig_{timestamp}.png"
+    proc_name = f"bg_{timestamp}.png"
 
-        processed_url = f"/images/processed/{processed_name}"
-        update_processing_done(db, img_record, processed_name, processed_url)
+    orig_path = os.path.join(ORIGINAL_DIR, orig_name)
+    proc_path = os.path.join(PROCESSED_DIR, proc_name)
 
-    except Exception as e:
-        update_processing_failed(db, img_record, str(e))
-        raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
+    # Save original image
+    with open(orig_path, "wb") as f:
+        f.write(image_bytes)
 
-    return {
-        "id": img_record.id,
-        "original_url": orig_url,
-        "processed_url": processed_url,
-        "status": img_record.status
-    }
+    # Remove background
+    processed_bytes = remove_bg_bytes(image_bytes)
 
+    # Save processed image
+    with open(proc_path, "wb") as f:
+        f.write(processed_bytes)
 
-@app.get("/images/{image_id}")
-def get_image_info(image_id: int, db: Session = Depends(get_db)):
-    img = get_image(db, image_id)
-    if not img:
-        raise HTTPException(status_code=404, detail="Image not found")
+    # Save DB record
+    img = save_image_record(
+        db,
+        original_file=f"images/originals/{orig_name}",
+        processed_file=f"images/processed/{proc_name}"
+    )
+
     return {
         "id": img.id,
-        "original_url": img.original_path,
-        "processed_url": img.processed_path,
-        "status": img.status,
-        "created_at": img.created_at,
-        "processed_at": img.processed_at,
+        "original_url": f"{BASE_URL}/images/originals/{orig_name}",
+        "processed_url": f"{BASE_URL}/images/processed/{proc_name}"
     }
 
 
-@app.get("/download/original/{image_id}")
-def download_original(image_id: int, db: Session = Depends(get_db)):
-    img = get_image(db, image_id)
+@app.get("/image/original/{image_id}")
+async def get_original(image_id: int, db: Session = Depends(get_db)):
+    img = db.query(Image).filter(Image.id == image_id).first()
     if not img:
-        raise HTTPException(status_code=404, detail="Not found")
-
-    local_path = img.original_path.replace("/images", "images")
-    if not os.path.exists(local_path):
-        raise HTTPException(status_code=404, detail="File missing")
-
-    return FileResponse(local_path, filename=img.original_filename)
+        raise HTTPException(status_code=404, detail="Image not found")
+    return {"file_url": f"{BASE_URL}/{img.original_file}"}
 
 
-@app.get("/download/processed/{image_id}")
-def download_processed(image_id: int, db: Session = Depends(get_db)):
-    img = get_image(db, image_id)
-    if not img or img.status != "done":
-        raise HTTPException(status_code=404, detail="Processed image not available")
-
-    local_path = img.processed_path.replace("/images", "images")
-    if not os.path.exists(local_path):
-        raise HTTPException(status_code=404, detail="File missing")
-
-    suggested_name = f"processed_{img.original_filename.rsplit('.',1)[0]}.png"
-    return FileResponse(local_path, filename=suggested_name)
+@app.get("/image/processed/{image_id}")
+async def get_processed(image_id: int, db: Session = Depends(get_db)):
+    img = db.query(Image).filter(Image.id == image_id).first()
+    if not img:
+        raise HTTPException(status_code=404, detail="Image not found")
+    return {"file_url": f"{BASE_URL}/{img.processed_file}"}
 
 
 @app.get("/")
 def read_root():
-    return {"message": "FastAPI + MySQL Background Remover API Running"}
+    return {"message": "FastAPI + MySQL Background Remover API Running ✅"}
