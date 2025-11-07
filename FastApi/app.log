@@ -1,0 +1,5 @@
+2025-11-07 15:36:46,368 [ERROR] Background removal failed: Background removal failed: There is no current event loop in thread 'AnyIO worker thread'.
+2025-11-07 15:36:46,368 [WARNING] Client Error: Failed to process image
+2025-11-07 15:45:57,896 [ERROR] Background removal failed: module 'signal' has no attribute 'SIGALRM'
+2025-11-07 15:45:57,896 [WARNING] Client Error: Failed to process image
+2025-11-07 15:47:48,156 [INFO] Background removed successfully: ID=9
