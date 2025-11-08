@@ -9,7 +9,7 @@ import re
 from database import get_db
 from models import Image
 from crud import save_image_record
-from utils import remove_bg_bytes
+from FastApi.utils1 import remove_bg_bytes
 from database import Base, engine
 Base.metadata.create_all(bind=engine)
 
